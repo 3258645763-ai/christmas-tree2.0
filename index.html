@@ -1,0 +1,240 @@
+	import math
+	import random
+	import pygame
+	try:
+	    import numpy as np
+	except ImportError:
+	    raise SystemExit("缺少 numpy，请先运行: pip install numpy")
+	# ================== 全局参数 ==================
+	WIDTH, HEIGHT = 1600, 900
+	BLACK = (0, 0, 0)
+	TREE_POINTS   = 50000      # 保持原密度，numpy 方案扛得住
+	GROUND_POINTS = 4000
+	STAR_POINTS   = 1200
+	HEART_POINTS  = 1000
+	SNOW2D_POINTS = 10
+	CAM_DIST   = 13.0
+	CAM_HEIGHT = 6.0
+	PITCH      = -0.25
+	FOV_SCALE  = HEIGHT * 0.63 # 原 project_point 中的焦距系数
+	TREE_HEIGHT = 12.0
+	ROT_SPEED   = 0.27         # rad/s = 原 0.0045/帧 @60fps，且与帧率解耦
+	GLOW_SCALE = 4             # 辉光层下采样倍数
+	GLOW_GAIN  = (115, 115, 115)   # 辉光强度（数值越小越暗）
+	SNOW_SCALE = 6             # 雪花层降采样倍数（10 个雪花不值得全屏层）
+	SW, SH = WIDTH // SNOW_SCALE, HEIGHT // SNOW_SCALE
+	# ================== 以下生成函数：视觉逻辑与原版完全一致 ==================
+	def gen_tree_points():
+	    pts = []
+	    loops = 9
+	    spiral_n = int(TREE_POINTS * 0.7)
+	    for _ in range(spiral_n):
+	        u = random.random()
+	        h = u ** 1.6
+	        y = TREE_HEIGHT * h + 0.2
+	        base_r = (1 - h) ** 1.1 * 3.2
+	        branch_wave = max(0.0, math.sin((h * 5.8 + 0.15) * math.tau))
+	        base_r *= 1.0 + 0.65 * branch_wave
+	        t = u * loops * math.tau
+	        angle = t + random.uniform(-0.22, 0.22)
+	        r = base_r * random.uniform(0.85, 1.08)
+	        x = math.cos(angle) * r
+	        z = math.sin(angle) * r
+	        mid_boost = max(0.15, 1.0 - abs(h - 0.55) * 1.5)
+	        base_g = 155 + int(90 * mid_boost)
+	        base_b = 185 + int(70 * mid_boost)
+	        color = (255,
+	                 min(255, base_g + random.randint(-15, 20)),
+	                 min(255, base_b + random.randint(-15, 35)))
+	        if random.random() < 0.08:
+	            color = (255, 255 - random.randint(0, 35), 230 + random.randint(0, 25))
+	        pts.append([x, y, z, color])
+	    fill_n = TREE_POINTS - spiral_n
+	    for _ in range(fill_n):
+	        h = random.random() ** 1.9
+	        y = TREE_HEIGHT * h + 0.2 + random.uniform(-0.08, 0.08)
+	        base_r = (1 - h) ** 1.1 * 4.3
+	        branch_wave = max(0.0, math.sin((h * 5.8 + 0.15) * math.tau))
+	        base_r *= 1.0 + 0.65 * branch_wave
+	        r = base_r * math.sqrt(random.random())
+	        angle = random.random() * math.tau
+	        x = math.cos(angle) * r + random.uniform(-0.08, 0.08)
+	        z = math.sin(angle) * r + random.uniform(-0.08, 0.08)
+	        pts.append([x, y, z, (255, random.randint(165, 225), random.randint(190, 250))])
+	    return pts
+	def gen_ground_points():
+	    pts = []
+	    rings = [4.6, 6.0, 7.4, 8.8, 10.2, 11.4]
+	    for _ in range(GROUND_POINTS):
+	        ring = random.choice(rings)
+	        r = random.gauss(ring, 0.3)
+	        theta = random.random() * math.tau
+	        c = random.randint(235, 255) if random.random() < 0.15 else random.randint(190, 235)
+	        pts.append([math.cos(theta) * r, -0.25, math.sin(theta) * r, (c, c, 255)])
+	    return pts
+	def gen_star_points():
+	    pts = []
+	    for _ in range(STAR_POINTS):
+	        base = random.randint(215, 255)
+	        pts.append([random.uniform(-18, 18), random.uniform(3, 18),
+	                    random.uniform(-18, 18), (base, base, 255)])
+	    return pts
+	def gen_heart_points():
+	    """2D 心形隐式方程采样 + z 抖动，挂在树顶（与原版一致）"""
+	    pts = []
+	    scale = 0.9
+	    top_y = TREE_HEIGHT + 0.05
+	    while len(pts) < HEART_POINTS:
+	        x = random.uniform(-1.3, 1.3)
+	        y = random.uniform(-1.4, 1.4)
+	        if (x * x + y * y - 1.0) ** 3 - x * x * (y ** 3) <= 0.0:
+	            wx = x * scale * 0.8
+	            wy = top_y + (y + 1.0) * scale * 0.5
+	            wz = random.uniform(-0.18, 0.18)
+	            factor = max(0.35, 1.15 - 0.5 * math.hypot(x, y))
+	            g = max(120, min(255, int(130 * factor + 80)))
+	            b = max(120, min(255, int(190 * factor + 70)))
+	            pts.append([wx, wy, wz, (255, g, b)])
+	    return pts
+	# ================== 一次性转成 numpy 数组（启动时执行一次） ==================
+	def build_field(*groups):
+	    pos = np.array([[p[0], p[1], p[2]] for g in groups for p in g], dtype=np.float32)
+	    col = np.array([p[3] for g in groups for p in g], dtype=np.uint8)
+	    return pos, col
+	# ================== 向量化渲染：替代 5.6 万次 Python 投影 ==================
+	def render_field(screen, pos, col, angle):
+	    """旋转 + 俯仰 + 投影一次矩阵化完成，surfarray 批量写像素"""
+	    ca, sa = math.cos(angle), math.sin(angle)
+	    cp, sp = math.cos(PITCH), math.sin(PITCH)
+	    x, y, z = pos[:, 0], pos[:, 1], pos[:, 2]
+	    xz = x * ca - z * sa          # yaw 旋转
+	    zz = x * sa + z * ca
+	    yp = y * cp - zz * sp - CAM_HEIGHT   # pitch + 相机高度
+	    zp = y * sp + zz * cp + CAM_DIST     # 深度
+	    visible = zp > 0.1            # 视锥剔除（向量化）
+	    xz, yp, zp = xz[visible], yp[visible], zp[visible]
+	    cols = col[visible]
+	    inv = FOV_SCALE / zp
+	    sx = (WIDTH * 0.5 + xz * inv).astype(np.int32)
+	    sy = (HEIGHT * 0.5 - yp * inv).astype(np.int32)
+	    # 先剔除屏幕外点，再进入绘制（原版是画完才判断）
+	    on_screen = (sx >= 0) & (sx < WIDTH) & (sy >= 0) & (sy < HEIGHT)
+	    sx, sy, zp, cols = sx[on_screen], sy[on_screen], zp[on_screen], cols[on_screen]
+	    if sx.size == 0:
+	        return
+	    size = 3.6 - zp * 0.13        # 深度感公式沿用原版，改为“光斑层级”
+	    arr = pygame.surfarray.pixels3d(screen)   # 拿像素视图（期间 surface 被锁定）
+	    arr[sx, sy] = cols                        # 中心像素：一次批量写入
+	    big = size >= 2.0                         # 近处点 → 十字光斑
+	    bx, by, bc = sx[big], sy[big], cols[big]
+	    if bx.size:
+	        bx0 = np.clip(bx - 1, 0, WIDTH - 1)
+	        bx1 = np.clip(bx + 1, 0, WIDTH - 1)
+	        by0 = np.clip(by - 1, 0, HEIGHT - 1)
+	        by1 = np.clip(by + 1, 0, HEIGHT - 1)
+	        arr[bx0, by] = bc
+	        arr[bx1, by] = bc
+	        arr[bx, by0] = bc
+	        arr[bx, by1] = bc
+	    huge = size >= 3.0                        # 极近点 → 补对角，近似 3px 圆
+	    hx, hy, hc = sx[huge], sy[huge], cols[huge]
+	    if hx.size:
+	        hx0 = np.clip(hx - 1, 0, WIDTH - 1)
+	        hx1 = np.clip(hx + 1, 0, WIDTH - 1)
+	        hy0 = np.clip(hy - 1, 0, HEIGHT - 1)
+	        hy1 = np.clip(hy + 1, 0, HEIGHT - 1)
+	        arr[hx0, hy0] = hc; arr[hx1, hy0] = hc
+	        arr[hx0, hy1] = hc; arr[hx1, hy1] = hc
+	    del arr                                   # 释放锁定，flip 前必须解锁
+	# ================== 廉价辉光：下采样→上采样→加法叠加 ==================
+	def update_glow(screen, glow_small, glow_big):
+	    pygame.transform.smoothscale(screen, glow_small.get_size(), glow_small)
+	    pygame.transform.smoothscale(glow_small, (WIDTH, HEIGHT), glow_big)
+	    glow_big.fill(GLOW_GAIN, special_flags=pygame.BLEND_MULT)   # 压低强度
+	def blit_glow(screen, glow_big):
+	    screen.blit(glow_big, (0, 0), special_flags=pygame.BLEND_ADD)
+	# ================== 前景雪花：低分辨率层（消除重复代码 + 省全屏开销） ==================
+	def new_flake():
+	    x = random.uniform(0, SW)
+	    y = random.uniform(-14, -2)
+	    radius = random.uniform(10.0, 16.0) / SNOW_SCALE
+	    speed = random.uniform(30.0, 45.0) / SNOW_SCALE
+	    travel = SH + 14 - y
+	    life = travel / speed
+	    return [x, y, radius, speed, life, life]
+	def init_snow2d():
+	    return [new_flake() for _ in range(SNOW2D_POINTS)]
+	def update_snow2d(flakes, dt):
+	    for f in flakes:
+	        f[1] += f[3] * dt
+	        f[4] -= dt
+	        if f[4] <= 0 or f[1] > SH + 8:
+	            f[:] = new_flake()
+	def draw_snow2d(surface, flakes):
+	    surface.fill((0, 0, 0, 0))
+	    for x, y, r, v, life, max_life in flakes:
+	        phase = life / max_life if max_life > 0 else 0.0
+	        alpha = 255 if phase > 0.3 else int(255 * phase / 0.3)
+	        alpha = max(0, min(255, alpha))
+	        cx, cy = int(x), int(y)
+	        for rr, aa in ((r * 1.3, alpha // 20), (r * 1.0, alpha // 12),
+	                       (r * 0.75, alpha // 6), (r * 0.55, alpha // 3),
+	                       (r * 0.45, alpha)):
+	            if aa > 0:
+	                pygame.draw.circle(surface, (255, 255, 255, aa), (cx, cy), max(1, int(rr)))
+	# ================== 主循环 ==================
+	def main():
+	    pygame.init()
+	    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+	    pygame.display.set_caption("Merry Christmas")
+	    clock = pygame.time.Clock()
+	    font = pygame.font.SysFont("monotypecorsiva,georgia,serif", 45)  # 加回退字体
+	    pos, col = build_field(
+	        gen_tree_points(), gen_ground_points(),
+	        gen_star_points(), gen_heart_points(),
+	    )
+	    snow2d = init_snow2d()
+	    snow_surface = pygame.Surface((SW, SH), pygame.SRCALPHA)
+	    snow_big = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+	    glow_small = pygame.Surface((WIDTH // GLOW_SCALE, HEIGHT // GLOW_SCALE)).convert()
+	    glow_big = pygame.Surface((WIDTH, HEIGHT)).convert()
+	    # 文本只渲染一次（原版每帧渲染两次）
+	    text1 = font.render("Merry Christmas", True, (255, 255, 255))
+	    text2 = font.render("647", True, (255, 255, 255))
+	    t1_h = text1.get_height()
+	    angle, frames = 0.0, 0
+	    glow_on, show_fps = True, True
+	    running = True
+	    while running:
+	        dt = min(clock.tick(60) / 1000.0, 0.05)   # clamp 防切窗后跳变
+	        for event in pygame.event.get():
+	            if event.type == pygame.QUIT:
+	                running = False
+	            elif event.type == pygame.KEYDOWN:
+	                if event.key == pygame.K_g:
+	                    glow_on = not glow_on          # G：辉光开关（性能弱的机器可关）
+	                elif event.key == pygame.K_f:
+	                    show_fps = not show_fps        # F：FPS 显示开关
+	        screen.fill(BLACK)
+	        render_field(screen, pos, col, angle)
+	        if glow_on:
+	            # 辉光层隔帧刷新（旋转慢，肉眼看不出差异），代价减半
+	            if frames % 2 == 0:
+	                update_glow(screen, glow_small, glow_big)
+	            blit_glow(screen, glow_big)
+	        screen.blit(text1, (40, HEIGHT // 3))
+	        screen.blit(text2, (40, HEIGHT // 3 + t1_h + 10))
+	        update_snow2d(snow2d, dt)
+	        draw_snow2d(snow_surface, snow2d)
+	        if frames % 2 == 0:                        # 雪花层同样隔帧放大
+	            pygame.transform.smoothscale(snow_surface, (WIDTH, HEIGHT), snow_big)
+	        screen.blit(snow_big, (0, 0))
+	        pygame.display.flip()
+	        angle += ROT_SPEED * dt                    # 帧率无关的旋转
+	        frames += 1
+	        if show_fps and frames % 30 == 0:
+	            pygame.display.set_caption(
+	                f"Merry Christmas | FPS {clock.get_fps():.0f} | G:辉光 F:帧率")
+	    pygame.quit()
+	if __name__ == "__main__":
+	    main()
